@@ -20,9 +20,9 @@
 #import "CDVFile.h"
 #import "CDVAssetLibraryFilesystem.h"
 #import <Cordova/CDV.h>
-#import <AssetsLibrary/ALAsset.h>
-#import <AssetsLibrary/ALAssetRepresentation.h>
-#import <AssetsLibrary/ALAssetsLibrary.h>
+// MIGRATED TO PHOTOS FRAMEWORK FOR iOS 26 COMPATIBILITY
+// AssetsLibrary was deprecated in iOS 9 and removed in iOS 26
+#import <Photos/Photos.h>
 #import <MobileCoreServices/MobileCoreServices.h>
 
 NSString* const kCDVAssetsLibraryPrefix = @"assets-library://";
@@ -190,64 +190,178 @@ NSString* const kCDVAssetsLibraryScheme = @"assets-library";
 
 - (void)readFileAtURL:(CDVFilesystemURL *)localURL start:(NSInteger)start end:(NSInteger)end callback:(void (^)(NSData*, NSString* mimeType, CDVFileError))callback
 {
-    ALAssetsLibraryAssetForURLResultBlock resultBlock = ^(ALAsset* asset) {
-        if (asset) {
-            // We have the asset!  Get the data and send it off.
-            ALAssetRepresentation* assetRepresentation = [asset defaultRepresentation];
-            NSUInteger size = (end > start) ? (end - start) : [assetRepresentation size];
-            Byte* buffer = (Byte*)malloc(size);
-            NSUInteger bufferSize = [assetRepresentation getBytes:buffer fromOffset:start length:size error:nil];
-            NSData* data = [NSData dataWithBytesNoCopy:buffer length:bufferSize freeWhenDone:YES];
-            NSString* MIMEType = (__bridge_transfer NSString*)UTTypeCopyPreferredTagWithClass((__bridge CFStringRef)[assetRepresentation UTI], kUTTagClassMIMEType);
+    // MIGRATED TO PHOTOS FRAMEWORK FOR iOS 26
+    // Convert assets-library:// URL to PHAsset localIdentifier
+    NSURL *assetURL = [self assetLibraryURLForLocalURL:localURL];
+    NSString *urlString = [assetURL absoluteString];
 
-            callback(data, MIMEType, NO_ERROR);
-        } else {
-            callback(nil, nil, NOT_FOUND_ERR);
+    // Extract the asset identifier from the URL
+    // assets-library://asset/asset.JPG?id=<UUID>&ext=JPG
+    NSString *assetIdentifier = nil;
+    NSURLComponents *components = [NSURLComponents componentsWithURL:assetURL resolvingAgainstBaseURL:NO];
+    for (NSURLQueryItem *item in components.queryItems) {
+        if ([item.name isEqualToString:@"id"]) {
+            assetIdentifier = item.value;
+            break;
         }
-    };
+    }
 
-    ALAssetsLibraryAccessFailureBlock failureBlock = ^(NSError* error) {
-        // Retrieving the asset failed for some reason.  Send the appropriate error.
-        NSLog(@"Error: %@", error);
-        callback(nil, nil, SECURITY_ERR);
-    };
+    if (!assetIdentifier) {
+        // Try to extract from path if query parameter not found
+        NSString *path = [assetURL path];
+        NSArray *components = [path componentsSeparatedByString:@"="];
+        if (components.count > 1) {
+            assetIdentifier = components[1];
+        }
+    }
 
-    ALAssetsLibrary* assetsLibrary = [[ALAssetsLibrary alloc] init];
-    [assetsLibrary assetForURL:[self assetLibraryURLForLocalURL:localURL] resultBlock:resultBlock failureBlock:failureBlock];
+    if (!assetIdentifier || assetIdentifier.length == 0) {
+        NSLog(@"[CDVAssetLibraryFilesystem] Could not extract asset identifier from URL: %@", urlString);
+        callback(nil, nil, NOT_FOUND_ERR);
+        return;
+    }
+
+    // Fetch PHAsset using the identifier
+    PHFetchResult<PHAsset *> *fetchResult = [PHAsset fetchAssetsWithLocalIdentifiers:@[assetIdentifier] options:nil];
+
+    if (fetchResult.count == 0) {
+        NSLog(@"[CDVAssetLibraryFilesystem] No asset found for identifier: %@", assetIdentifier);
+        callback(nil, nil, NOT_FOUND_ERR);
+        return;
+    }
+
+    PHAsset *asset = fetchResult.firstObject;
+    PHImageManager *imageManager = [PHImageManager defaultManager];
+
+    // Request image or video data
+    if (asset.mediaType == PHAssetMediaTypeImage) {
+        PHImageRequestOptions *options = [[PHImageRequestOptions alloc] init];
+        options.synchronous = NO;
+        options.networkAccessAllowed = YES;
+        options.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
+
+        [imageManager requestImageDataForAsset:asset options:options resultHandler:^(NSData *imageData, NSString *dataUTI, UIImageOrientation orientation, NSDictionary *info) {
+            if (imageData) {
+                NSUInteger size = (end > start) ? (end - start) : imageData.length;
+                NSRange range = NSMakeRange(start, MIN(size, imageData.length - start));
+                NSData *subdata = [imageData subdataWithRange:range];
+
+                NSString *mimeType = (__bridge_transfer NSString *)UTTypeCopyPreferredTagWithClass((__bridge CFStringRef)dataUTI, kUTTagClassMIMEType);
+                callback(subdata, mimeType, NO_ERROR);
+            } else {
+                NSError *error = info[PHImageErrorKey];
+                NSLog(@"[CDVAssetLibraryFilesystem] Error reading image: %@", error);
+                callback(nil, nil, NOT_READABLE_ERR);
+            }
+        }];
+    } else if (asset.mediaType == PHAssetMediaTypeVideo) {
+        PHVideoRequestOptions *options = [[PHVideoRequestOptions alloc] init];
+        options.networkAccessAllowed = YES;
+        options.deliveryMode = PHVideoRequestOptionsDeliveryModeHighQualityFormat;
+
+        [imageManager requestAVAssetForVideo:asset options:options resultHandler:^(AVAsset *avAsset, AVAudioMix *audioMix, NSDictionary *info) {
+            if ([avAsset isKindOfClass:[AVURLAsset class]]) {
+                AVURLAsset *urlAsset = (AVURLAsset *)avAsset;
+                NSError *error = nil;
+                NSData *videoData = [NSData dataWithContentsOfURL:urlAsset.URL options:0 error:&error];
+
+                if (videoData) {
+                    NSUInteger size = (end > start) ? (end - start) : videoData.length;
+                    NSRange range = NSMakeRange(start, MIN(size, videoData.length - start));
+                    NSData *subdata = [videoData subdataWithRange:range];
+                    callback(subdata, @"video/mp4", NO_ERROR);
+                } else {
+                    NSLog(@"[CDVAssetLibraryFilesystem] Error reading video: %@", error);
+                    callback(nil, nil, NOT_READABLE_ERR);
+                }
+            } else {
+                callback(nil, nil, NOT_READABLE_ERR);
+            }
+        }];
+    } else {
+        callback(nil, nil, NOT_READABLE_ERR);
+    }
 }
 
 - (void)getFileMetadataForURL:(CDVFilesystemURL *)localURL callback:(void (^)(CDVPluginResult *))callback
 {
-    // In this case, we need to use an asynchronous method to retrieve the file.
-    // Because of this, we can't just assign to `result` and send it at the end of the method.
-    // Instead, we return after calling the asynchronous method and send `result` in each of the blocks.
-    ALAssetsLibraryAssetForURLResultBlock resultBlock = ^(ALAsset* asset) {
-        if (asset) {
-            // We have the asset!  Populate the dictionary and send it off.
-            NSMutableDictionary* fileInfo = [NSMutableDictionary dictionaryWithCapacity:5];
-            ALAssetRepresentation* assetRepresentation = [asset defaultRepresentation];
-            [fileInfo setObject:[NSNumber numberWithUnsignedLongLong:[assetRepresentation size]] forKey:@"size"];
-            [fileInfo setObject:localURL.fullPath forKey:@"fullPath"];
-            NSString* filename = [assetRepresentation filename];
-            [fileInfo setObject:filename forKey:@"name"];
-            [fileInfo setObject:[CDVAssetLibraryFilesystem getMimeTypeFromPath:filename] forKey:@"type"];
-            NSDate* creationDate = [asset valueForProperty:ALAssetPropertyDate];
-            NSNumber* msDate = [NSNumber numberWithDouble:[creationDate timeIntervalSince1970] * 1000];
-            [fileInfo setObject:msDate forKey:@"lastModifiedDate"];
+    // MIGRATED TO PHOTOS FRAMEWORK FOR iOS 26
+    NSURL *assetURL = [self assetLibraryURLForLocalURL:localURL];
+    NSString *urlString = [assetURL absoluteString];
 
-            callback([CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:fileInfo]);
-        } else {
-            // We couldn't find the asset.  Send the appropriate error.
-            callback([CDVPluginResult resultWithStatus:CDVCommandStatus_IO_EXCEPTION messageAsInt:NOT_FOUND_ERR]);
+    // Extract asset identifier
+    NSString *assetIdentifier = nil;
+    NSURLComponents *components = [NSURLComponents componentsWithURL:assetURL resolvingAgainstBaseURL:NO];
+    for (NSURLQueryItem *item in components.queryItems) {
+        if ([item.name isEqualToString:@"id"]) {
+            assetIdentifier = item.value;
+            break;
         }
-    };
-    ALAssetsLibraryAccessFailureBlock failureBlock = ^(NSError* error) {
-        // Retrieving the asset failed for some reason.  Send the appropriate error.
-        callback([CDVPluginResult resultWithStatus:CDVCommandStatus_IO_EXCEPTION messageAsString:[error localizedDescription]]);
-    };
+    }
 
-    ALAssetsLibrary* assetsLibrary = [[ALAssetsLibrary alloc] init];
-    [assetsLibrary assetForURL:[self assetLibraryURLForLocalURL:localURL] resultBlock:resultBlock failureBlock:failureBlock];
-    return;
+    if (!assetIdentifier) {
+        NSString *path = [assetURL path];
+        NSArray *pathComponents = [path componentsSeparatedByString:@"="];
+        if (pathComponents.count > 1) {
+            assetIdentifier = pathComponents[1];
+        }
+    }
+
+    if (!assetIdentifier || assetIdentifier.length == 0) {
+        NSLog(@"[CDVAssetLibraryFilesystem] Could not extract asset identifier from URL: %@", urlString);
+        callback([CDVPluginResult resultWithStatus:CDVCommandStatus_IO_EXCEPTION messageAsInt:NOT_FOUND_ERR]);
+        return;
+    }
+
+    // Fetch PHAsset
+    PHFetchResult<PHAsset *> *fetchResult = [PHAsset fetchAssetsWithLocalIdentifiers:@[assetIdentifier] options:nil];
+
+    if (fetchResult.count == 0) {
+        NSLog(@"[CDVAssetLibraryFilesystem] No asset found for identifier: %@", assetIdentifier);
+        callback([CDVPluginResult resultWithStatus:CDVCommandStatus_IO_EXCEPTION messageAsInt:NOT_FOUND_ERR]);
+        return;
+    }
+
+    PHAsset *asset = fetchResult.firstObject;
+
+    // Retrieve asset resources to get file size
+    NSArray<PHAssetResource *> *resources = [PHAssetResource assetResourcesForAsset:asset];
+    PHAssetResource *resource = resources.firstObject;
+
+    NSMutableDictionary *fileInfo = [NSMutableDictionary dictionaryWithCapacity:5];
+
+    // Get file size (approximate for photos)
+    if (resource) {
+        NSNumber *fileSize = [resource valueForKey:@"fileSize"];
+        if (fileSize) {
+            [fileInfo setObject:fileSize forKey:@"size"];
+        } else {
+            // Estimate size based on pixel dimensions for images
+            if (asset.mediaType == PHAssetMediaTypeImage) {
+                NSInteger estimatedSize = asset.pixelWidth * asset.pixelHeight * 4; // Rough estimate
+                [fileInfo setObject:@(estimatedSize) forKey:@"size"];
+            } else {
+                [fileInfo setObject:@(0) forKey:@"size"];
+            }
+        }
+
+        // Filename
+        NSString *filename = resource.originalFilename ?: @"asset";
+        [fileInfo setObject:filename forKey:@"name"];
+        [fileInfo setObject:[CDVAssetLibraryFilesystem getMimeTypeFromPath:filename] forKey:@"type"];
+    } else {
+        [fileInfo setObject:@(0) forKey:@"size"];
+        [fileInfo setObject:@"asset" forKey:@"name"];
+        [fileInfo setObject:@"application/octet-stream" forKey:@"type"];
+    }
+
+    [fileInfo setObject:localURL.fullPath forKey:@"fullPath"];
+
+    // Creation/modification date
+    NSDate *creationDate = asset.creationDate ?: [NSDate date];
+    NSNumber *msDate = @([creationDate timeIntervalSince1970] * 1000);
+    [fileInfo setObject:msDate forKey:@"lastModifiedDate"];
+
+    callback([CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:fileInfo]);
 }
 @end
